@@ -1,0 +1,340 @@
+name: "CNTi Test Suite"
+description: "Run the CNTi Test Suite (cnti-testsuite) against a CNF to check its adherence to cloud native best practices"
+author: "LF Networking / CNTi"
+branding:
+  icon: "check-circle"
+  color: "blue"
+
+inputs:
+  version:
+    description: "cnti-testsuite release tag to use (e.g. v2.0.0), v2.0.0 or newer. Default: latest release."
+    required: false
+    default: "latest"
+  cnf_config:
+    description: "Path to a cnti-testsuite.yaml describing the CNF. Takes precedence over helm_chart_dir."
+    required: false
+    default: ""
+  helm_chart_dir:
+    description: "Path to a local Helm chart directory. A minimal v2 config is generated for it when cnf_config is not set."
+    required: false
+    default: ""
+  tests:
+    description: "Task to run: cert (default), workload, all, static, a category (e.g. security) or a single test name."
+    required: false
+    default: "cert"
+  extra_args:
+    description: "Extra arguments appended to the test command (e.g. '--strict', '--poc', '--skip <test>')."
+    required: false
+    default: ""
+  log_level:
+    description: "cnti-testsuite log level (trace, debug, info, notice, warn, error, fatal), exported as CNTI_TESTSUITE_LOG_LEVEL. Default: the suite's default (error)."
+    required: false
+    default: ""
+  install_timeout:
+    description: "Seconds to wait for the CNF to become ready during cnf_install (passed as --timeout). Default: the suite's default."
+    required: false
+    default: ""
+  create_kind_cluster:
+    description: "Create a kind cluster for the run. Set to false to use the cluster from $KUBECONFIG."
+    required: false
+    default: "true"
+  kind_config:
+    description: "Path to a kind cluster config. Default: 1 control-plane + 2 workers."
+    required: false
+    default: ""
+  kind_version:
+    description: "kind version passed to helm/kind-action. Default: the version helm/kind-action ships with."
+    required: false
+    default: ""
+  kind_load_images:
+    description: "Whitespace-separated local Docker images to load into the kind cluster (kind load docker-image), e.g. one built earlier in the job. Only used when create_kind_cluster is true."
+    required: false
+    default: ""
+  fail_on_failure:
+    description: "Fail the job when the test run does not meet its objective (non-zero exit code)."
+    required: false
+    default: "true"
+  upload_results:
+    description: "Upload the results directory as a workflow artifact."
+    required: false
+    default: "true"
+  artifact_name:
+    description: "Name of the uploaded results artifact."
+    required: false
+    default: "cnti-testsuite-results"
+  badge_branch:
+    description: "Publish a results badge (tests passed / maximum, coloured by the verdict; cnti-badge.svg and cnti-badge.json in shields.io endpoint format) to this orphan branch of the repository with the job's GITHUB_TOKEN - no secret needed, but the job needs 'permissions: contents: write'. Only runs on the default branch. Empty: off."
+    required: false
+    default: ""
+  gist_badge_id:
+    description: "Optional: gist ID to publish a shields.io badge to (requires gist_badge_secret). Use badge_branch instead unless the badge must live outside this repository."
+    required: false
+    default: ""
+  gist_badge_secret:
+    description: "Optional: token with gist scope used to update the badge gist."
+    required: false
+    default: ""
+  gist_badge_filename:
+    description: "Filename of the badge inside the gist."
+    required: false
+    default: "cnti_badge.json"
+
+outputs:
+  status:
+    description: "Overall verdict of the run: passed, failed or error."
+    value: ${{ steps.results.outputs.status }}
+  exit_code:
+    description: "Exit code of cnti-testsuite (0 passed, 1 failed, 2 error, 64 usage error)."
+    value: ${{ steps.results.outputs.exit_code }}
+  passed:
+    description: "Number of tests passed."
+    value: ${{ steps.results.outputs.passed }}
+  max_passed:
+    description: "Number of tests that could have passed."
+    value: ${{ steps.results.outputs.max_passed }}
+  essential_passed:
+    description: "Number of essential tests passed."
+    value: ${{ steps.results.outputs.essential_passed }}
+  essential_max_passed:
+    description: "Number of essential tests that could have passed."
+    value: ${{ steps.results.outputs.essential_max_passed }}
+  points:
+    description: "Points scored by the run."
+    value: ${{ steps.results.outputs.points }}
+  maximum_points:
+    description: "Maximum points the run could have scored."
+    value: ${{ steps.results.outputs.maximum_points }}
+  criteria:
+    description: "Pass criterion of the run as compact JSON (e.g. the cert essential threshold), empty when the task has none."
+    value: ${{ steps.results.outputs.criteria }}
+  results_file:
+    description: "Path to the results YAML of this run."
+    value: ${{ steps.results.outputs.results_file }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve cnti-testsuite version
+      id: version
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        if [[ "$REQUESTED" == "latest" || -z "$REQUESTED" ]]; then
+          tag=$(gh api repos/lfn-cnti/testsuite/releases/latest --jq .tag_name)
+        else
+          tag="$REQUESTED"
+        fi
+        case "$tag" in
+          v0.*|v1.*) echo "::error::cnti-testsuite $tag is not supported: this action needs v2.0.0 or newer (binary, config and results contract changed in 2.0.0)"; exit 1 ;;
+        esac
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "Using cnti-testsuite $tag"
+
+    - name: Cache cnti-testsuite binary
+      id: cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.cnti-testsuite/cnti-testsuite
+        key: cnti-testsuite-${{ steps.version.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install cnti-testsuite
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TAG: ${{ steps.version.outputs.tag }}
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.cnti-testsuite
+        url="https://github.com/lfn-cnti/testsuite/releases/download/${TAG}/cnti-testsuite-${TAG}.tar.gz"
+        curl --fail --silent --show-error -L "$url" -o /tmp/cnti-testsuite.tar.gz
+        tar -C ~/.cnti-testsuite -xf /tmp/cnti-testsuite.tar.gz
+        chmod a+x ~/.cnti-testsuite/cnti-testsuite
+
+    - name: Add cnti-testsuite to PATH
+      shell: bash
+      run: echo "$HOME/.cnti-testsuite" >> "$GITHUB_PATH"
+
+    - name: Ensure yq
+      shell: bash
+      env:
+        YQ_VERSION: v4.53.6
+      run: |
+        set -euo pipefail
+        if command -v yq >/dev/null; then exit 0; fi
+        case "$(uname -m)" in
+          x86_64) arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+          *) echo "::error::Unsupported architecture for yq: $(uname -m)"; exit 1 ;;
+        esac
+        mkdir -p "$RUNNER_TEMP/yq-bin"
+        curl --fail --silent --show-error -L "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${arch}" -o "$RUNNER_TEMP/yq-bin/yq"
+        chmod a+x "$RUNNER_TEMP/yq-bin/yq"
+        echo "$RUNNER_TEMP/yq-bin" >> "$GITHUB_PATH"
+
+    - name: Write default kind config
+      if: inputs.create_kind_cluster == 'true' && inputs.kind_config == ''
+      shell: bash
+      run: |
+        cat > "$RUNNER_TEMP/cnti-testsuite-kind.yaml" <<'KIND'
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+        KIND
+
+    - name: Create kind cluster
+      if: inputs.create_kind_cluster == 'true' && inputs.kind_version == ''
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.15.0
+      with:
+        cluster_name: cnti-testsuite
+        config: ${{ inputs.kind_config != '' && inputs.kind_config || format('{0}/cnti-testsuite-kind.yaml', runner.temp) }}
+
+    - name: Create kind cluster (pinned kind version)
+      if: inputs.create_kind_cluster == 'true' && inputs.kind_version != ''
+      uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.15.0
+      with:
+        cluster_name: cnti-testsuite
+        config: ${{ inputs.kind_config != '' && inputs.kind_config || format('{0}/cnti-testsuite-kind.yaml', runner.temp) }}
+        version: ${{ inputs.kind_version }}
+
+    - name: Load images into kind
+      if: inputs.create_kind_cluster == 'true' && inputs.kind_load_images != ''
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.kind_load_images }}
+      run: |
+        set -euo pipefail
+        for image in $IMAGES; do
+          echo "Loading $image into the kind cluster"
+          kind load docker-image "$image" --name cnti-testsuite
+        done
+
+    - name: Prepare CNF config
+      id: config
+      shell: bash
+      env:
+        CNF_CONFIG: ${{ inputs.cnf_config }}
+        HELM_CHART_DIR: ${{ inputs.helm_chart_dir }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$CNF_CONFIG" ]]; then
+          [[ -f "$CNF_CONFIG" ]] || { echo "::error::cnf_config '$CNF_CONFIG' not found"; exit 1; }
+          echo "path=$CNF_CONFIG" >> "$GITHUB_OUTPUT"
+        elif [[ -n "$HELM_CHART_DIR" ]]; then
+          [[ -f "$HELM_CHART_DIR/Chart.yaml" ]] || { echo "::error::helm_chart_dir '$HELM_CHART_DIR' has no Chart.yaml"; exit 1; }
+          cfg="$RUNNER_TEMP/cnti-testsuite.yaml"
+          cat > "$cfg" <<CFG
+        ---
+        config_version: v2
+        deployments:
+          helm_dirs:
+            - name: cnf
+              helm_directory: "$(realpath "$HELM_CHART_DIR")"
+        CFG
+          echo "path=$cfg" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::Either cnf_config or helm_chart_dir must be set"; exit 1
+        fi
+
+    - name: cnti-testsuite setup
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$LOG_LEVEL" ]]; then export CNTI_TESTSUITE_LOG_LEVEL="$LOG_LEVEL"; fi
+        cnti-testsuite setup
+
+    - name: Install CNF
+      shell: bash
+      env:
+        CNF_CONFIG_PATH: ${{ steps.config.outputs.path }}
+        INSTALL_TIMEOUT: ${{ inputs.install_timeout }}
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$LOG_LEVEL" ]]; then export CNTI_TESTSUITE_LOG_LEVEL="$LOG_LEVEL"; fi
+        args=(cnf_install --cnf-config "$CNF_CONFIG_PATH")
+        if [[ -n "$INSTALL_TIMEOUT" ]]; then args+=(--timeout "$INSTALL_TIMEOUT"); fi
+        cnti-testsuite "${args[@]}"
+
+    - name: Run tests
+      id: run
+      shell: bash
+      env:
+        TESTS: ${{ inputs.tests }}
+        EXTRA_ARGS: ${{ inputs.extra_args }}
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: |
+        set -uo pipefail
+        if [[ -n "$LOG_LEVEL" ]]; then export CNTI_TESTSUITE_LOG_LEVEL="$LOG_LEVEL"; fi
+        # `shell: bash` runs with -e; a non-zero suite exit is the result here, not a step failure.
+        set +e
+        # shellcheck disable=SC2086
+        cnti-testsuite $TESTS $EXTRA_ARGS
+        rc=$?
+        set -e
+        echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+        echo "cnti-testsuite exited with $rc"
+
+    - name: Read results
+      id: results
+      if: always()
+      shell: bash
+      env:
+        RUN_EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+      run: bash "${{ github.action_path }}/scripts/read_results.sh"
+
+    - name: Uninstall CNF
+      # A kind cluster created here dies with the job; only clean up clusters we were given.
+      if: always() && inputs.create_kind_cluster != 'true'
+      shell: bash
+      run: cnti-testsuite cnf_uninstall || true
+
+    - name: Upload results
+      if: always() && inputs.upload_results == 'true' && steps.results.outputs.results_file != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: cnti/results/
+        if-no-files-found: ignore
+
+    - name: Publish badge
+      if: always() && inputs.badge_branch != '' && steps.results.outputs.status != ''
+      shell: bash
+      env:
+        BADGE_BRANCH: ${{ inputs.badge_branch }}
+        RUN_EXIT_CODE: ${{ steps.run.outputs.exit_code }}
+        TESTS: ${{ inputs.tests }}
+        STATUS: ${{ steps.results.outputs.status }}
+        PASSED: ${{ steps.results.outputs.passed }}
+        MAX_PASSED: ${{ steps.results.outputs.max_passed }}
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/scripts/publish_badge.sh"
+
+    - name: Update gist badge
+      if: always() && inputs.gist_badge_id != '' && (steps.run.outputs.exit_code == '0' || steps.run.outputs.exit_code == '1')
+      uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483 # v1.7.0
+      with:
+        auth: ${{ inputs.gist_badge_secret }}
+        gistID: ${{ inputs.gist_badge_id }}
+        filename: ${{ inputs.gist_badge_filename }}
+        label: "CNTi ${{ inputs.tests }}"
+        message: "${{ steps.results.outputs.passed }}/${{ steps.results.outputs.max_passed }}"
+        color: ${{ steps.results.outputs.status == 'passed' && 'brightgreen' || 'red' }}
+
+    - name: Enforce result
+      if: always() && inputs.fail_on_failure == 'true'
+      shell: bash
+      env:
+        RC: ${{ steps.run.outputs.exit_code }}
+        STATUS: ${{ steps.results.outputs.status }}
+      run: |
+        if [[ -z "$RC" ]]; then echo "::error::cnti-testsuite did not run"; exit 2; fi
+        if [[ "$RC" == "64" ]]; then echo "::error::cnti-testsuite usage error (exit 64): check the tests and extra_args inputs"; exit 64; fi
+        if [[ "$RC" != "0" ]]; then echo "::error::cnti-testsuite run ${STATUS:-failed} (exit code $RC)"; exit "$RC"; fi
