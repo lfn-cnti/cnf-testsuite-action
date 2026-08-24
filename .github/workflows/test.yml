@@ -1,0 +1,54 @@
+name: Self-test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  coredns:
+    name: coredns (${{ matrix.version }}${{ matrix.extra_args && format(' {0}', matrix.extra_args) || '' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: latest
+            extra_args: ""
+            expect_exit: "0"
+          - version: v2.0.0
+            extra_args: ""
+            expect_exit: "0"
+          # --strict stops at the first failed test: exercises the exit-1 path
+          - version: latest
+            extra_args: --strict
+            expect_exit: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Fetch example CNF
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: lfn-cnti/testsuite
+          path: testsuite
+          sparse-checkout: example-cnfs/coredns
+      - name: Run action
+        id: cnti
+        uses: ./
+        with:
+          version: ${{ matrix.version }}
+          cnf_config: testsuite/example-cnfs/coredns/cnti-testsuite.yaml
+          extra_args: ${{ matrix.extra_args }}
+          log_level: info
+          fail_on_failure: false
+      - name: Check outputs
+        run: |
+          echo "status=${{ steps.cnti.outputs.status }} exit=${{ steps.cnti.outputs.exit_code }}"
+          echo "essential ${{ steps.cnti.outputs.essential_passed }}/${{ steps.cnti.outputs.essential_max_passed }}"
+          test -n "${{ steps.cnti.outputs.results_file }}"
+          test "${{ steps.cnti.outputs.exit_code }}" = "${{ matrix.expect_exit }}"
+          test -n "${{ steps.cnti.outputs.maximum_points }}"
